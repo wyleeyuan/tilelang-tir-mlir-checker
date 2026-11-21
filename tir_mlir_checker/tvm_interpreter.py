@@ -5,11 +5,14 @@ listed execution semantics. Unknown nodes/calls/layouts stop, never disappear.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
+from copy import copy
+
 import numpy as np
 
 from .capabilities import (TIR_BATCH2_TILES,TIR_BATCH_SCALARS,TIR_BREAKS,TIR_CUMSUM,TIR_EXTERN,
                            TIR_SERIAL_MARKERS,TIR_TAIL_STATEMENTS,TIR_TUPLE)
-from .execution import Buffer, Budget, Expr, LoopBreak, SemanticFault, Unsupported, apply, cast, concrete_index, extern_scalar, select, tir_scalar
+from .execution import Buffer, Budget, Expr, LoopBreak, SemanticFault, Unsupported, apply, cast, concrete_index, dtype, extern_scalar, select, tir_scalar
 from .tir_tail_contracts import SWIZZLE_ATTR, WARP_FENCE, extern_error, marker_error, tuple_error
 from .tile_ops import (GEMM_OPS, accumulate_matrix, check_hints, copy_region, cumsum_region, fill_region,
                        gemm_controls, gemm_view, matmul_shape, matrix_step, reduction_details,
@@ -17,6 +20,12 @@ from .tile_ops import (GEMM_OPS, accumulate_matrix, check_hints, copy_region, cu
 
 
 class TVMInterpreter:
+    local_init_attr = 'tl.local_var_init'
+    storage_sync = 'tir.tvm_storage_sync'
+    shared_scopes = {'shared', 'shared.dyn'}
+    initializer_dtypes = {'bool','bfloat16','float8_e4m3fn'} | {
+        kind + str(bits) for kind,widths in [('int',(8,16,32,64)),('uint',(8,16,32,64)),('float',(16,32,64))]
+        for bits in widths}
     binary = {"Add": "add", "Sub": "sub", "Mul": "mul", "Div": "div",
               "FloorDiv": "floordiv", "FloorMod": "mod", "Mod": "rem",
               "EQ": "eq", "NE": "ne", "LT": "lt", "LE": "le", "GT": "gt", "GE": "ge",
@@ -30,13 +39,16 @@ class TVMInterpreter:
         allowed = set(self.binary) | {'IntImm','FloatImm','StringImm','Var','SizeVar',
             'BufferLoad','Cast','Not','Select','Let','Call','Ramp','SeqStmt','LetStmt',
             'For','IfThenElse','BufferStore','Evaluate','AttrStmt','Block','BlockRealize','BufferRegion','Range'}
-        calls = set(self.calls) | set(TIR_BATCH_SCALARS) | TIR_BATCH2_TILES | TIR_TAIL_STATEMENTS | {TIR_EXTERN,'tir.if_then_else','tir.assume',
+        calls = set(self.calls) | set(TIR_BATCH_SCALARS) | TIR_BATCH2_TILES | TIR_TAIL_STATEMENTS | {self.storage_sync,TIR_EXTERN,'tir.if_then_else','tir.assume',
             'tl.tileop.region','tl.tileop.copy','tl.tileop.reduce'}
-        gaps,tail_nodes,standalone=set(),{},set()
+        self.layout_owners = {}
+        gaps,tail_nodes,standalone,blocks,accessed=set(),{},set(),[],{}
         def preflight(node):
             kind = type(node).__name__
             if kind not in allowed:
                 gaps.add(f'TIR node {kind} 尚未支持')
+            if kind in {'BufferLoad','BufferStore'}:
+                accessed[self.key(node.buffer)] = node.buffer
             op = self.op_name(node)
             if kind == 'Call' and op not in calls:
                 gaps.add(f'TIR Call {op or node.op} 尚未支持（包括未执行分支）')
@@ -45,12 +57,21 @@ class TVMInterpreter:
                 if problem: gaps.add(problem)
                 if op in TIR_TAIL_STATEMENTS: tail_nodes[self.key(node)]=op
             if kind == 'Block':
+                blocks.append(node)
                 try:
                     self.check_block_metadata(node,'Block')
                 except Unsupported as exc:
                     gaps.add(str(exc))
             if kind=='Evaluate' and self.op_name(node.value) in TIR_TAIL_STATEMENTS:
                 standalone.add(self.key(node.value))
+            if op == self.storage_sync:
+                try: self.sync_scope(node)
+                except Unsupported as exc: gaps.add(str(exc))
+                tail_nodes[self.key(node)] = op
+            if kind == 'Evaluate' and self.op_name(node.value) == self.storage_sync:
+                standalone.add(self.key(node.value))
+            if kind == 'AttrStmt' and self.op_name(node.value) == self.storage_sync:
+                gaps.add(f'{self.storage_sync}: 屏障仅允许作为独立 Evaluate')
             if kind=='AttrStmt' and str(node.attr_key)==SWIZZLE_ATTR and self.op_name(node.value)==TIR_TUPLE:
                 standalone.add(self.key(node.value))
                 problem=self.tail_error(node.value,TIR_TUPLE,metadata=True)
@@ -67,7 +88,7 @@ class TVMInterpreter:
                 value=getattr(node,field,None)
                 vals=value if field in {'args','indices','iter_values'} and value is not None else (value,)
                 for v in vals:
-                    if self.op_name(v) in TIR_TAIL_STATEMENTS:
+                    if self.op_name(v) in TIR_TAIL_STATEMENTS | {self.storage_sync}:
                         gaps.add(f'{self.op_name(v)}: 仅支持 Evaluate 或允许的元数据，不能用作值')
             if op in TIR_BATCH2_TILES:
                 if len(node.args) not in ((10,19) if op in GEMM_OPS else (2,)):
@@ -77,8 +98,23 @@ class TVMInterpreter:
                 except Unsupported as exc:
                     gaps.add(str(exc))
         tvm.tir.stmt_functor.post_order_visit(function.body,preflight)
+        for key, buf in accessed.items():
+            owner = self.layout_owners.get(self.key(buf.data),key)
+            if owner != key:
+                gaps.add('Block: layout_map 不支持同一 data Var 的不同访存描述符')
+        self.initializers = {}
+        try:
+            self.inspect_initializers(blocks)
+        except Unsupported as exc:
+            gaps.add(str(exc))
         for key,op in tail_nodes.items():
             if key not in standalone: gaps.add(f'{op}: 仅支持 Evaluate 或允许的元数据，不能用作值')
+        self.sync_subtrees = set()
+        self.cooperative_launches = set()
+        self.block_launches_with_sync = set()
+        if self.storage_sync in tail_nodes.values():
+            try: self.inspect_sync_tree(function.body)
+            except Unsupported as exc: gaps.add(str(exc))
         # Throw outside the FFI callback so TVM does not wrap Unsupported as an
         # internal TVMError and erase the supported/unsupported distinction.
         if gaps: raise Unsupported(sorted(gaps)[0])
@@ -100,6 +136,222 @@ class TVMInterpreter:
             dt=str(node.dtype)
             return bool(node.value) if dt=='bool' else int(node.value) if dt.startswith(('int','uint')) and 'x' not in dt else None
         return None
+
+    @staticmethod
+    def statement_children(node):
+        kind = type(node).__name__
+        if kind == 'SeqStmt':
+            return tuple((f'.seq[{i}]', stmt) for i, stmt in enumerate(node.seq))
+        fields = {'BlockRealize':('block',), 'Block':('init','body'),
+                  'IfThenElse':('then_case','else_case')}.get(kind, ('body',))
+        return tuple((f'.{field}', child) for field in fields
+                     if (child := getattr(node, field, None)) is not None)
+
+    def inspect_initializers(self, blocks):
+        key = self.local_init_attr
+        attrs = self.fun.attrs
+        func_map = attrs[key] if attrs is not None and key in attrs else None
+        if func_map is None and not any(key in b.annotations for b in blocks):
+            return
+
+        def collect(mapping, buffers, path):
+            if type(mapping).__name__ != 'Map':
+                raise Unsupported(f'{path}: {key} 必须是 Var → PrimExpr 的 Map')
+            result = {}
+            for var, value in mapping.items():
+                matches = [b for b in buffers if b.data.same_as(var)] if type(var).__name__ == 'Var' else []
+                if len(matches) != 1 or matches[0].scope() not in {'local', 'local.var'}:
+                    raise Unsupported(f'{path}: {key} 的目标必须是本作用域唯一的局部 Buffer.data')
+                if any((n := self.constant(s)) is not None and n <= 0 for s in matches[0].shape):
+                    raise Unsupported(f'{path}: {key} 的缓冲区没有全零下标元素')
+                result[self.key(matches[0])] = (matches[0], value)
+            return result
+
+        defaults = collect(func_map, [buf for b in blocks for buf in b.alloc_buffers], 'PrimFunc') if func_map is not None else {}
+        scoped = {self.key(b): collect(b.annotations[key], b.alloc_buffers, 'Block')
+                  for b in blocks if key in b.annotations}
+        bound_shapes = {self.key(dim) for buf in self.fun.buffer_map.values() for dim in buf.shape
+                        if type(dim).__name__ in {'Var', 'SizeVar'}}
+
+        def walk(node, bound):
+            kind = type(node).__name__
+            if kind == 'Block':
+                overrides = scoped.get(self.key(node), {})
+                for b in node.alloc_buffers:
+                    k = self.key(b)
+                    for source in (defaults, overrides):
+                        if k in source:
+                            _, value = source[k]
+                            self.check_initializer(value, str(b.dtype), bound)
+                            self.initializers[k] = value
+            var = (node.var if kind == 'LetStmt' else node.loop_var if kind == 'For' else
+                   node.node.var if kind == 'AttrStmt' and str(node.attr_key) == 'thread_extent' else None)
+            if var is not None:
+                bound = bound | {self.key(var)}
+            for _, child in self.statement_children(node):
+                walk(child, bound)
+
+        walk(self.fun.body, bound_shapes)
+
+    def check_initializer(self, value, target, bound):
+        def fail():
+            raise Unsupported(f'{self.local_init_attr}: 初始值必须是作用域内、类型兼容的纯标量表达式')
+
+        def compatible(src, dst):
+            return (src in self.initializer_dtypes and dst in self.initializer_dtypes and
+                    not (src.startswith(('float','bfloat')) and dst.startswith(('int','uint'))))
+
+        def expr(node, names):
+            dt = str(getattr(node, 'dtype', ''))
+            if dt not in self.initializer_dtypes: fail()
+            kind = type(node).__name__
+            if kind in {'IntImm','FloatImm'}: return
+            if kind in {'Var','SizeVar'} and self.key(node) in names: return
+            if kind == 'Cast' and compatible(str(node.value.dtype), dt):
+                expr(node.value, names); return
+            if kind == 'Not': expr(node.a, names); return
+            if kind in self.binary and (kind != 'Div' or dt.startswith('float')):
+                expr(node.a, names); expr(node.b, names); return
+            if kind == 'Select':
+                for child in (node.condition, node.true_value, node.false_value): expr(child, names)
+                return
+            if kind == 'Let':
+                expr(node.value, names); expr(node.body, names | {self.key(node.var)}); return
+            fail()
+
+        if not compatible(str(getattr(value,'dtype','')), target): fail()
+        expr(value, bound)
+
+    def sync_scope(self, call):
+        args = call.args
+        scope = self.constant(args[0]) if len(args) == 1 else None
+        if scope not in self.shared_scopes or getattr(call, 'annotations', None):
+            raise Unsupported(f'{self.storage_sync}: 只支持单个 shared/shared.dyn 字面量作用域，无分组参数')
+        return scope
+
+    def is_sync(self, node):
+        return type(node).__name__ == 'Evaluate' and self.op_name(node.value) == self.storage_sync
+
+    def thread_tag(self, node):
+        if type(node).__name__ == 'AttrStmt' and str(node.attr_key) == 'thread_extent':
+            if type(node.node).__name__ != 'IterVar':
+                raise Unsupported(f'{self.storage_sync}: thread_extent 必须绑定 IterVar')
+            return str(node.node.thread_tag)
+        return ''
+
+    def inspect_sync_tree(self, root):
+        def mark(node):
+            children = [mark(child) for _, child in self.statement_children(node)]
+            if any(children) or self.is_sync(node):
+                self.sync_subtrees.add(self.key(node))
+                return True
+            return False
+
+        mark(root)
+
+        def inspect(node, blocks=()):
+            if self.key(node) not in self.sync_subtrees:
+                return
+            if (type(node).__name__ == 'For' and getattr(node,'thread_binding',None) is not None
+                    or type(node).__name__ == 'AttrStmt' and str(node.attr_key) == 'virtual_thread'):
+                raise Unsupported(f'{self.storage_sync}: 仅支持 AttrStmt thread_extent 物理线程分相')
+            tag = self.thread_tag(node)
+            if tag and tag not in {f'{p}.{a}' for p in ('threadIdx','blockIdx') for a in 'xyz'}:
+                raise Unsupported(f'{self.storage_sync}: 未支持线程轴 {tag}')
+            if tag.startswith('blockIdx.'):
+                blocks = (*blocks, self.key(node))
+            if tag.startswith('threadIdx.') and self.constant(node.value) != 1:
+                extent = self.constant(node.value)
+                if tag != 'threadIdx.x' or type(extent) is not int or not 2 <= extent <= 1024:
+                    raise Unsupported(f'{self.storage_sync}: 仅分相静态单一 threadIdx.x（2..1024）')
+                self.inspect_cooperation(node.body)
+                self.cooperative_launches.add(self.key(node))
+                self.block_launches_with_sync.update(blocks)
+                return
+            for _, child in self.statement_children(node):
+                inspect(child, blocks)
+
+        inspect(root)
+
+    def inspect_cooperation(self, root):
+        buffers = {self.key(b) for b in self.fun.buffer_map.values()}
+        owners = {self.key(b.data):self.key(b) for b in self.fun.buffer_map.values()}
+
+        def fail(reason):
+            raise Unsupported(f'{self.storage_sync}: {reason}')
+
+        def check_barrier_positions(node):
+            if self.key(node) not in self.sync_subtrees:
+                return
+            kind = type(node).__name__
+            if kind == 'IfThenElse': fail('多物理线程条件分支内的屏障尚未支持')
+            if kind == 'For':
+                step = getattr(node,'step',None)
+                if (int(node.kind) != 0 or type(self.constant(node.min)) is not int
+                        or type(self.constant(node.extent)) is not int or self.constant(node.extent) < 0
+                        or step is not None and self.constant(step) != 1):
+                    fail('多物理线程循环内的屏障需要静态一致、单位步长的串行循环')
+            for _,child in self.statement_children(node): check_barrier_positions(child)
+
+        def visit(node, uniform=True):
+            kind = type(node).__name__
+            has_sync = self.key(node) in self.sync_subtrees
+            if kind == 'IfThenElse':
+                uniform = False
+            elif kind == 'For':
+                loop_kind = int(node.kind)
+                step = getattr(node,'step',None)
+                if loop_kind not in {0, 3} and (loop_kind != 1 or self.constant(node.extent) != 1
+                                              or len(node.annotations)):
+                    fail('物理线程分相内的逻辑并行布局/向量循环尚未建模')
+                self.check_for_metadata(node, '物理线程分相')
+                if step is not None and self.constant(step) != 1:
+                    fail('物理线程分相内的循环需要单位步长')
+                uniform = False  # shared allocations below a loop have a different lifetime
+            elif kind == 'AttrStmt':
+                tag = self.thread_tag(node)
+                if tag:
+                    if tag not in {'threadIdx.y','threadIdx.z'} or self.constant(node.value) != 1:
+                        fail('多维、重复或嵌套的非单位线程启动尚未建模')
+                elif str(node.attr_key) != 'tl.assume':
+                    fail(f'物理线程分相内未支持 AttrStmt {node.attr_key}')
+            elif kind == 'BlockRealize':
+                if self.constant(node.predicate) is not True or len(node.iter_values):
+                    fail('物理线程分相内的块需要常真谓词、无迭代轴')
+            elif kind == 'Block':
+                if node.init is not None or len(node.iter_vars) or len(node.match_buffers):
+                    fail('物理线程分相内未支持块归约 init、迭代轴或 match_buffers')
+                for b in node.alloc_buffers:
+                    bkey,dkey = self.key(b),self.key(b.data)
+                    if dkey in owners:
+                        fail('物理线程分相内未建模同一 data Var 的多个分配或 Buffer 描述符')
+                    owners[dkey] = bkey
+                    scope = b.scope()
+                    if scope in self.shared_scopes:
+                        if not uniform or any(type(self.constant(s)) is not int for s in b.shape):
+                            fail('共享分配需要无分支、无循环且各线程一致的静态生命周期')
+                    elif scope not in {'local','local.var'}:
+                        fail(f'物理线程分相内未建模的分配作用域 {scope}')
+                    buffers.add(bkey)
+            elif has_sync and not self.is_sync(node) and kind not in {'SeqStmt','LetStmt'}:
+                fail(f'无法确定 {kind} 中的屏障到达顺序')
+            for _, child in self.statement_children(node):
+                visit(child, uniform)
+
+        check_barrier_positions(root)
+        visit(root)
+        problems = set()
+
+        def effects(node):
+            kind = type(node).__name__
+            if kind in {'BufferLoad','BufferStore'} and self.key(node.buffer) not in buffers:
+                problems.add('物理线程分相内不支持捕获未证明作用域的外部局部分配或 Buffer 别名')
+            if kind == 'Call' and self.op_name(node) in (TIR_BREAKS | TIR_BATCH2_TILES | TIR_SERIAL_MARKERS |
+                    {TIR_CUMSUM,'tl.tileop.copy','tl.tileop.reduce'}):
+                problems.add(f'物理线程分相内未建模 {self.op_name(node)} 的跨线程执行方式')
+
+        self.tvm.tir.stmt_functor.post_order_visit(root, effects)
+        if problems: fail(sorted(problems)[0])
 
     def tail_error(self,node,op,metadata=False):
         if getattr(node,'annotations',None):
@@ -342,6 +594,8 @@ class TVMInterpreter:
         from tilelang.layout import Layout
 
         for key, value in block.annotations.items():
+            if str(key) == self.local_init_attr:
+                continue  # Checked with the allocation and lexical bindings in inspect_initializers.
             if str(key) != 'layout_map':
                 raise Unsupported(f'{path}: 未支持 Block 注解 {key}')
             if (block.init is not None or len(block.iter_vars) or
@@ -350,40 +604,82 @@ class TVMInterpreter:
             buffers = {self.key(buf.data):buf for buf in block.alloc_buffers}
             for var,layout in value.items():
                 buf = buffers.get(self.key(var))
-                if (buf is None or not buf.data.same_as(var) or buf.scope() != 'shared.dyn'
-                        or len(buf.shape) != 2 or len(buf.strides) or len(buf.axis_separators)
+                if (buf is None or not buf.data.same_as(var) or buf.scope() not in self.shared_scopes
+                        or not len(buf.shape) or len(buf.strides) or len(buf.axis_separators)
                         or self.constant(buf.elem_offset) != 0 or type(layout) is not Layout):
-                    raise Unsupported(f'{path}: layout_map 需要块内二维连续 shared.dyn 分配和普通 Layout')
+                    raise Unsupported(f'{path}: layout_map 需要块内连续 shared/shared.dyn 分配和普通 Layout（非 Fragment）')
                 shape = tuple(map(self.constant,buf.shape))
                 declared = tuple(map(self.constant,layout.get_input_shape()))
                 if any(type(n) is not int or n <= 0 for n in shape) or declared != shape:
                     raise Unsupported(f'{path}: layout_map 输入尺寸须与局部分配一致')
-                coords,forward = list(layout.get_forward_vars()),list(layout.get_forward_index())
-                # The captured tiling uses only injective row-major packing,
-                # possibly with row padding. Logical coordinates ignore the
-                # padding; no two coordinates may alias. Swizzles, fragments
-                # and mappings to a different buffer are outside this contract.
-                if len(coords) != 2 or len(forward) != 1:
-                    raise Unsupported(f'{path}: layout_map 仅支持二维行主序 packing')
-                def placeholder(value, pos):
-                    expected = coords[pos]
-                    # Layout's input placeholders are synthetic and scoped to
-                    # this descriptor. JSON can recreate their object handles.
-                    return (type(value).__name__ == 'Var'
-                            and str(value.name) == str(expected.name)
-                            and str(value.dtype) == str(expected.dtype))
+                self.check_layout_mapping(layout,shape,path)
+                dkey,bkey = self.key(buf.data),self.key(buf)
+                if self.layout_owners.setdefault(dkey,bkey) != bkey:
+                    raise Unsupported(f'{path}: layout_map 不支持同一 data Var 的不同分配描述符')
 
-                expr = forward[0]
-                if type(expr).__name__ != 'Add' or not placeholder(expr.b,1):
-                    raise Unsupported(f'{path}: layout_map 仅支持 row * stride + col')
-                mul = expr.a
-                stride = self.constant(mul.b) if type(mul).__name__ == 'Mul' and placeholder(mul.a,0) else None
-                if type(stride) is not int or stride < shape[1]:
-                    raise Unsupported(f'{path}: layout_map 行主序步长无效或产生重叠')
-                max_index = (shape[0]-1)*stride + shape[1]-1
-                index_dtype = str(expr.dtype)
-                if index_dtype not in ('int32','int64') or max_index >= 1 << (int(index_dtype[3:])-1):
-                    raise Unsupported(f'{path}: layout_map 物理索引类型非法或溢出')
+    def check_layout_mapping(self, layout, shape, path):
+        # Layout metadata can be ignored for logical accesses only after proving
+        # that distinct logical elements cannot share the same physical cell.
+        coords = list(layout.get_forward_vars())
+        forward = list(layout.get_forward_index())
+        if len(coords) != len(shape) or not forward:
+            raise Unsupported(f'{path}: layout_map 需要合法的输入输出维度')
+
+        # FFI reconstruction can return different handles for synthetic input
+        # placeholders. Their names are scoped to this one Layout descriptor.
+        def identifier(var):
+            return (str(var.name),str(var.dtype)) if type(var).__name__ == 'Var' else None
+
+        ids = list(map(identifier,coords))
+        if None in ids or len(set(ids)) != len(ids):
+            raise Unsupported(f'{path}: layout_map 输入占位符不唯一')
+        if len(forward) == len(shape) and all(
+                identifier(expr) == ids[i] or shape[i] == 1 and self.constant(expr) == 0
+                for i,expr in enumerate(forward)):
+            # An identity tuple has no arithmetic that can overflow; each
+            # individual coordinate still needs a representable signed index.
+            if all(dt in ('int32','int64') and n <= 1 << (int(dt[3:])-1)
+                   for (_,dt),n in zip(ids,shape)):
+                return
+            raise Unsupported(f'{path}: layout_map 物理索引类型非法或溢出')
+        if len(forward) != 1:
+            raise Unsupported(f'{path}: layout_map 仅支持恒等坐标或单索引行主序 packing')
+
+        root = forward[0]
+        dt = str(root.dtype)
+        coeff = {}
+
+        def linear(expr):
+            if str(expr.dtype) != dt:
+                raise Unsupported(f'{path}: layout_map 不支持混合位宽下标计算')
+            kind = type(expr).__name__
+            if kind == 'Add':
+                linear(expr.a); linear(expr.b)
+                return
+            if kind == 'IntImm' and self.constant(expr) == 0:
+                return
+            if kind == 'Mul' and str(expr.a.dtype) == dt and str(expr.b.dtype) == dt:
+                var,weight = identifier(expr.a),self.constant(expr.b)
+                if var is None: var,weight = identifier(expr.b),self.constant(expr.a)
+            else:
+                var,weight = identifier(expr),1
+            if var not in ids or var in coeff or type(weight) is not int or weight <= 0:
+                raise Unsupported(f'{path}: layout_map 仅支持正步长的行主序线性式；拒绝 swizzle 或重叠')
+            coeff[var] = weight
+
+        linear(root)
+        footprint = 1
+        for dim,var in reversed(list(zip(shape,ids))):
+            if dim == 1: continue  # the omitted coordinate is always zero
+            stride = coeff.get(var,0)
+            if stride < footprint or (footprint == 1 and stride != 1):
+                raise Unsupported(f'{path}: layout_map 行主序步长无效或产生重叠')
+            footprint += (dim-1)*stride
+        # OutputShape() is derived from Forward, not a separately declared
+        # physical domain. After a JSON reload it can contain fresh symbolic
+        # placeholders. Derive its bound exactly from the static input domain.
+        if dt not in ('int32','int64') or footprint > 1 << (int(dt[3:])-1):
+            raise Unsupported(f'{path}: layout_map 物理索引类型非法或溢出')
 
     def check_for_metadata(self, node, path):
         if not len(node.annotations):
@@ -399,13 +695,117 @@ class TVMInterpreter:
         raise Unsupported(f'{path}: 带布局/其他 annotations 的 For 尚未支持')
 
     def alloc(self, node, path):
-        from .execution import dtype
         if len(node.strides) or len(node.axis_separators) or int(self.expr(node.elem_offset,path)) != 0:
             raise Unsupported(f"{path}: 局部显式 stride/offset 尚未支持")
         shape = tuple(int(self.expr(s,path)) for s in node.shape)
         self.budget.shape(shape)
-        self.buffers[self.key(node)] = Buffer(np.empty(shape,dtype=dtype(str(node.dtype))),initialized=False,
+        key = self.key(node)
+        shared = self.phase_shared if node.scope() in self.shared_scopes else None
+        if shared is not None and key in shared:
+            self.buffers[key] = shared[key]
+            return
+        buf = Buffer(np.empty(shape,dtype=dtype(str(node.dtype))),initialized=False,
             symbolic=self.symbolic,budget=self.budget,name=str(node.name))
+        self.buffers[key] = buf
+        if shared is not None:
+            shared[key] = buf
+        init = self.initializers.get(key)
+        if init is not None:
+            # The RISC-V lowering stores at all-zero indices; it does not fill the buffer.
+            buf.write((0,) * len(shape), cast(self.expr(init, path+'.initializer'), str(node.dtype)), 0)
+            self.event(node, path, action='local_var_init', buffer=buf.name)
+
+    @contextmanager
+    def bindings(self, mapping, keys):
+        missing = object()
+        previous = {key: mapping.get(key, missing) for key in keys}
+        try:
+            yield
+        finally:
+            for key, original in previous.items():
+                if original is missing: mapping.pop(key, None)
+                else: mapping[key] = original
+
+    @contextmanager
+    def block_allocations(self, block, path):
+        with self.bindings(self.buffers, (self.key(b) for b in block.alloc_buffers)):
+            for i,b in enumerate(block.alloc_buffers):
+                self.alloc(b, path+f'.alloc_buffers[{i}]')
+            yield
+
+    def check_assumption(self, node, path):
+        if type(node.value).__name__ != 'StringImm' or str(getattr(node.node,'dtype','')) != 'bool':
+            raise Unsupported(f'{path}: tl.assume 需要布尔条件和字符串说明')
+        value = self.expr(node.node, path+'.condition')
+        if isinstance(value,Expr) or not bool(value):
+            raise Unsupported(f'{path}: 输入未能验证 tl.assume 条件')
+
+    def launch_cooperative(self, node, path, extent):
+        shared = {}
+        lanes = []
+        var = node.node.var
+        for tid in range(extent):
+            lane = copy(self)
+            lane.env, lane.buffers = dict(self.env), dict(self.buffers)
+            lane.loop_specs, lane.loop_stack = dict(self.loop_specs), list(self.loop_stack)
+            lane.env[self.key(var)] = cast(tid, str(var.dtype))
+            lane.phase_shared = shared
+            lane.nonunit_threads += 1
+            lanes.append(lane.cooperate(node.body, path+'.body'))
+        finished = object()
+        try:
+            while True:
+                region = self.budget.new_region()
+                arrivals = []
+                for tid,lane in enumerate(lanes):
+                    with self.budget.iteration(region,tid):
+                        arrivals.append(next(lane, finished))
+                if all(x is finished for x in arrivals): return
+                if any(x != arrivals[0] for x in arrivals[1:]):
+                    raise SemanticFault('物理线程没有全部到达同一屏障', rule_id='SYNC-DIVERGENT-BARRIER')
+        finally:
+            for lane in lanes: lane.close()
+
+    def cooperate(self, node, path):
+        if self.key(node) not in self.sync_subtrees:
+            self.stmt(node,path)
+            return
+        # Do not hold a Budget context manager over yield: all lanes share it.
+        self.budget.tick()
+        if self.is_sync(node):
+            scope = self.sync_scope(node.value)
+            self.event(node,path,action='thread_phase_barrier',scope=scope)
+            yield (path,scope)
+            return
+        kind = type(node).__name__
+        if kind in {'SeqStmt','BlockRealize'}:
+            for suffix,child in self.statement_children(node):
+                yield from self.cooperate(child,path+suffix)
+        elif kind == 'Block':
+            with self.block_allocations(node,path):
+                yield from self.cooperate(node.body,path+'.body')
+        elif kind == 'LetStmt':
+            with self.bindings(self.env,[self.key(node.var)]):
+                self.env[self.key(node.var)] = self.expr(node.value,path+'.value')
+                yield from self.cooperate(node.body,path+'.body')
+        elif kind == 'AttrStmt':
+            if str(node.attr_key) == 'tl.assume':
+                self.check_assumption(node,path)
+                yield from self.cooperate(node.body,path+'.body')
+            else:
+                var = node.node.var
+                with self.bindings(self.env,[self.key(var)]):
+                    self.env[self.key(var)] = cast(0,str(var.dtype))
+                    yield from self.cooperate(node.body,path+'.body')
+        elif kind == 'For':
+            lo,n = self.constant(node.min),self.constant(node.extent)
+            with self.bindings(self.env,[self.key(node.loop_var)]):
+                for i in range(lo,lo+n):
+                    self.budget.tick()
+                    self.env[self.key(node.loop_var)] = cast(i,str(node.loop_var.dtype))
+                    yield from self.cooperate(node.body,path+'.body')
+        else:
+            raise Unsupported(f'{path}: 屏障分相没有为 {kind} 建模')
 
     def uses(self, node, variable):
         # Consider executable expressions, not declarative reads/writes metadata.
@@ -485,10 +885,19 @@ class TVMInterpreter:
                 self.writer_locations[(buf.position,tuple(map(int,idx)))] = self.location(node,path)
             self.event(node,path,action="write",buffer=buf.name,index=[int(i) for i in idx])
         elif kind == "Evaluate":
-            if type(node.value).__name__ == "Call": self.tile(node.value,path+".value")
+            if self.is_sync(node):
+                scope = self.sync_scope(node.value)
+                if self.nonunit_threads:
+                    raise Unsupported(f'{path}: 多物理线程屏障必须通过分相执行')
+                self.event(node,path,action='serial_barrier',scope=scope)
+            elif type(node.value).__name__ == "Call": self.tile(node.value,path+".value")
             elif type(node.value).__name__ == "IntImm" and int(node.value.value) == 0: pass
             else: raise Unsupported(f"{path}: 未支持 Evaluate {type(node.value).__name__}")
         elif kind == "AttrStmt":
+            if str(node.attr_key) == 'tl.assume':
+                self.check_assumption(node,path)
+                self.stmt(node.body,path+'.body')
+                return
             if str(node.attr_key)==SWIZZLE_ATTR and self.op_name(node.value)==TIR_TUPLE:
                 problem=self.tail_error(node.value,TIR_TUPLE,metadata=True)
                 if problem: raise Unsupported(problem)
@@ -501,8 +910,14 @@ class TVMInterpreter:
             extent = int(self.expr(node.value,path+".value"))
             if extent<1: raise Unsupported(f"{path}: 非法 thread extent")
             if tag.startswith("blockIdx."):
-                for i in range(extent):
-                    self.env[self.key(var)] = cast(i,str(var.dtype));self.stmt(node.body,path+".body")
+                region = self.budget.new_region() if self.key(node) in self.block_launches_with_sync and extent > 1 else None
+                with self.bindings(self.env,[self.key(var)]):
+                    for i in range(extent):
+                        self.env[self.key(var)] = cast(i,str(var.dtype))
+                        with self.budget.iteration(region,i) if region is not None else nullcontext():
+                            self.stmt(node.body,path+".body")
+            elif self.key(node) in self.cooperative_launches:
+                self.launch_cooperative(node,path,extent)
             elif tag.startswith("threadIdx.") and (extent == 1 or not self.uses(node.body,var)):
                 self.env[self.key(var)] = cast(0,str(var.dtype))
                 self.nonunit_threads += extent!=1
@@ -558,18 +973,18 @@ class TVMInterpreter:
             if node.init is not None:
                 raise Unsupported(f"{path}: 独立 Block.init 尚未支持")
             self.check_block_metadata(node,path)
-            for i,buf in enumerate(node.alloc_buffers): self.alloc(buf,path+f".alloc_buffers[{i}]")
-            self.stmt(node.body,path+".body")
+            with self.block_allocations(node,path):
+                self.stmt(node.body,path+".body")
         else:
             raise Unsupported(f"{path}: 未支持语句 {kind}")
 
     def run(self, buffers, symbols=None, symbolic=False):
-        from .execution import dtype
         self.budget = buffers[0].budget if buffers else Budget(self.max_steps)
         self.symbolic,self.env,self.buffers,self.events,self.reductions = symbolic,{},{},[],[]
         self.writer_locations = {}
         self.loop_specs = {}
         self.loop_stack,self.nonunit_threads = [],0
+        self.phase_shared = None
         if len(self.fun.params) != len(buffers): raise Unsupported("TIR 参数数量与测试契约不同")
         for param,buf in zip(self.fun.params,buffers):
             if param not in self.fun.buffer_map: raise Unsupported("目前只支持 buffer 参数")
@@ -594,6 +1009,7 @@ class TVMInterpreter:
                 raise Unsupported("显式 stride 与用例连续布局不一致")
         self.stmt(self.fun.body)
         return {"steps":self.budget.steps,"backend":"tvm_tir_nodes",
-                "execution_model":"logical blocks; only unused physical thread axes",
+                "execution_model":("serialized shared barrier phases with checked lane accesses"
+                                   if self.cooperative_launches else "logical blocks; only unused or unit physical thread axes"),
                 "location_model":"node paths + original spans; no exported-text line mapping",
                 "node_events":self.events,"reductions":self.reductions}
