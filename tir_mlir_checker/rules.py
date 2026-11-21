@@ -124,9 +124,9 @@ def mlir_inventory(source, stage, observed, *, backend='text'):
         if op not in MLIR_OPS and op != 'func.func':
             issues.append(finding('CAP-MLIR-OP', 'unsupported', 'static', f'未支持操作 {op}',
                                  stage=stage, line=line, details={'operation': op}))
-        if op in {'scf.for', 'scf.parallel'}:
+        if op in {'scf.for', 'scf.parallel', 'scf.while'}:
             facts['loops'].append({'line': line, 'text': text})
-            if ('iter_args' in text and backend != 'official') or ' init ' in text:
+            if op != 'scf.while' and (('iter_args' in text and backend != 'official') or ' init ' in text):
                 issues.append(finding('CAP-LOOP-ARGS', 'unsupported', 'static', '携带循环值/归约的形式尚未支持', stage=stage, line=line))
         if op == 'scf.reduce' and re.search(r'scf.reduce\s*\(', text):
             issues.append(finding('CAP-SCF-REDUCE', 'unsupported', 'static', '带值 scf.reduce 尚未支持', stage=stage, line=line))

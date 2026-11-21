@@ -12,12 +12,18 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .execution import Buffer, Expr, SemanticFault, Unsupported, apply, cast, concrete_index, dtype, select, storage_type, trace_value, mlir_cast, mlir_cmpi, mlir_cmpf, scalar_op, scalar_type
+from .execution import Buffer, Budget, Expr, SemanticFault, Unsupported, apply, cast, concrete_index, dtype, select, storage_type, trace_value, mlir_cast, mlir_cmpi, mlir_cmpf, scalar_op, scalar_type, while_test
 from .capabilities import AFFINE_MATMUL_MAP, MAP_ALIAS, MLIR_BATCH_CASTS, MLIR_BATCH_SCALARS, MLIR_MATMUL, MLIR_OPS
 from .tile_ops import (accumulate_matrix,
                        matmul_shape, matrix_step, matrix_transposes, parse_matrix_map, reduction_details)
 
-SSA = r"%[\w.$-]+"
+SSA_NAME = r"%[\w.$-]+"
+SSA = rf"{SSA_NAME}(?:#\d+)?"
+SCALAR_KIND = r'(?:i(?:1|8|16|32|64)|index|bf16|f(?:16|32|64)|f8E4M3FN)'
+SCF_WHILE = (rf'(?:(?P<result>{SSA_NAME})(?::(?P<count>[1-9]\d*))?\s*=\s*)?'
+             r'scf\.while\s*(?:\((?P<init>[^()]*)\)\s*)?:\s*'
+             rf'\((?P<ins>[^()]*)\)\s*->\s*(?:\((?P<outs>[^()]*)\)|(?P<out>{SCALAR_KIND}))\s*\{{')
+SCF_CONDITION = rf'scf\.condition\(\s*({SSA})\s*\)(?:\s+(.*))?'
 MLIR_BATCH_PATTERNS = {
     name: re.escape(name) + ' ' + ', '.join([f'({SSA})'] * arity) + r' : (\w+)'
     for name, (_, arity) in MLIR_BATCH_SCALARS.items()
@@ -37,6 +43,65 @@ def split_types(text):
         elif c==',' and depth==0:parts.append(text[start:i].strip());start=i+1
     parts.append(text[start:].strip())
     return parts
+
+
+def while_parts(text, pattern):
+    parts=tuple(x.strip() for x in text.split(',')) if text.strip() else ()
+    if not all(re.fullmatch(pattern,p) for p in parts):
+        raise Unsupported('scf.while 只支持标准单行标量参数和 SSA 列表')
+    return parts
+
+
+def while_values(text, kinds):
+    values,sep,types=(text or '').partition(':')
+    operands=while_parts(values,SSA)
+    if (bool(operands)!=bool(sep) or while_parts(types,SCALAR_KIND)!=kinds
+            or len(operands)!=len(kinds)):
+        raise Unsupported('scf.while 终结符的参数或类型不匹配')
+    return operands
+
+
+def while_text(node):
+    header=re.fullmatch(SCF_WHILE,node.text)
+    if not header:
+        raise Unsupported(f'L{node.line}: 未支持的 scf.while 标头')
+    result,count,init,ins,outs,out=header.groups()
+    ins,outs=while_parts(ins,SCALAR_KIND),while_parts(outs if outs is not None else out,SCALAR_KIND)
+    result_count=int(count or 1) if result else 0
+    if result_count!=len(outs):
+        raise Unsupported(f'L{node.line}: scf.while 声明的结果数量不匹配')
+    result_names=(() if not result else
+                  tuple(f'{result}#{i}' for i in range(result_count)) if count else (result,))
+    binding=rf'({SSA_NAME})\s*=\s*({SSA})'
+    pairs=tuple(re.fullmatch(binding,p).groups() for p in while_parts(init or '',binding))
+    before_names=tuple(a for a,_ in pairs)
+    if len(set(before_names))!=len(ins) or len(pairs)!=len(ins):
+        raise Unsupported(f'L{node.line}: scf.while 初始参数数量或名称不匹配')
+    body=node.otherwise
+    after_names=()
+    if body and body[0].text.startswith('^'):
+        block=re.fullmatch(r'\^bb\d+(?:\(([^()]*)\))?:',body[0].text)
+        if not block:
+            raise Unsupported('scf.while 的 after 块需要标准 ^bbN 参数声明')
+        arg=rf'({SSA_NAME})\s*:\s*({SCALAR_KIND})'
+        params=tuple(re.fullmatch(arg,p).groups() for p in while_parts(block[1] or '',arg))
+        after_names=tuple(a for a,_ in params)
+        if tuple(t for _,t in params)!=outs or len(set(after_names))!=len(after_names):
+            raise Unsupported('scf.while 的 after 块参数类型或数量不匹配')
+        body=body[1:]
+    if len(after_names)!=len(outs):
+        raise Unsupported('scf.while 缺少 after 块参数')
+    if not node.body or not (cond:=re.fullmatch(SCF_CONDITION,node.body[-1].text)):
+        raise Unsupported(f'L{node.line}: scf.while 缺少 scf.condition')
+    if not body or not (yielded:=re.fullmatch(r'scf\.yield(?:\s+(.*))?',body[-1].text)):
+        raise Unsupported(f'L{node.line}: scf.while 缺少 scf.yield')
+    condition_values=while_values(cond[2],outs)
+    yield_values=while_values(yielded[1],ins)
+    for term in (node.body[-1],body[-1]):
+        if term.body or term.otherwise:
+            raise Unsupported('scf.while 终结符不能有 region')
+    return (pairs,ins,outs,result_names,after_names,body,
+            cond[1],condition_values,yield_values)
 
 def memref_type(text):
     m=re.fullmatch(rf'memref<((?:(?:\d+|\?)x)*)(\w+)(?:, strided<\[({LAYOUT_STRIDES})\](?:, offset: ({LAYOUT_INT}))?>)?>',text)
@@ -125,9 +190,14 @@ def _parse(source, aliases):
             if alias[1] in aliases: raise Unsupported('重复的 matmul affine map 别名')
             aliases[alias[1]]=parse_matrix_map(alias[2])
             continue
-        if line == "} else {":
-            if len(stack) < 2 or "scf.if" not in stack[-1][0].text:
-                raise Unsupported(f"L{number}: 无法解析 else")
+        if line in {"} else {", "} do {"}:
+            if len(stack)<2:
+                raise Unsupported(f"L{number}: 无法解析 {line}")
+            header,body=stack[-1]
+            matches=(re.fullmatch(SCF_WHILE,header.text) if line=="} do {"
+                     else re.match(rf'^(?:{SSA_NAME}\s*=\s*)?scf\.if\s',header.text))
+            if not matches or body is header.otherwise:
+                raise Unsupported(f"L{number}: 无法解析 {line}")
             node = stack.pop()[0]
             stack.append((node, node.otherwise))
             continue
@@ -157,6 +227,7 @@ class MLIRInterpreter:
 
     def __init__(self, source):
         self.map_aliases,self.matmul_specs={},{}
+        self.while_specs={}
         self.function = _parse(source,self.map_aliases)
         match = re.fullmatch(r"func\.func @([\w.$-]+)\((.*)\) \{", self.function.text)
         if match is None:
@@ -173,11 +244,19 @@ class MLIRInterpreter:
             self.layouts[arg[1]]=(strides,offset)
         self._preflight(self.function.body)
 
-    def _preflight(self, nodes):
+    def _preflight(self, nodes, *, inside_while=False, direct_while=False):
         for node in nodes:
+            if re.fullmatch(SCF_WHILE,node.text):
+                spec=self.while_specs[node.line]=while_text(node)
+                self._preflight(node.body[:-1],inside_while=True,direct_while=True)
+                self._preflight(spec[5][:-1],inside_while=True,direct_while=True)
+                continue
             text = re.sub(rf"^{SSA}\s*=\s*", "", node.text)
             token = re.match(r"[\w.]+",text)
             op = token[0] if token else ""
+            if (op=='scf.condition' or (inside_while and op=='return')
+                    or (direct_while and op in {'scf.yield','scf.reduce'})):
+                raise Unsupported(f'L{node.line}: {op} 终结符位置不合法')
             if op not in self.OPS:
                 raise Unsupported(f"L{node.line}: 未支持 MLIR 操作 {op}")
             if op in MLIR_MATMUL:
@@ -220,14 +299,14 @@ class MLIRInterpreter:
                 dtype(type_name)
             if node.body and op not in {"scf.for", "scf.parallel", "scf.if"}:
                 raise Unsupported(f"L{node.line}: 未支持的 region")
-            self._preflight(node.body)
-            self._preflight(node.otherwise)
+            self._preflight(node.body,inside_while=inside_while)
+            self._preflight(node.otherwise,inside_while=inside_while)
 
     def run(self, buffers, symbols=None, symbolic=False):
         if len(buffers) != len(self.parameters):
             raise Unsupported("MLIR 参数数量与测试契约不符")
         self.symbolic = symbolic
-        self.budget = buffers[0].budget
+        self.budget = buffers[0].budget if buffers else Budget()
         self.pure_only = False
         self.writer_locations, self.reductions = {}, []
         env = {}
@@ -277,8 +356,35 @@ class MLIRInterpreter:
         if buf.position is not None:
             self.writer_locations[(buf.position,buf.root_index(index))]={'stage_text_line':line}
 
+    def execute_while(self,node,env,spec):
+        pairs,ins,outs,result_names,after_names,body,test,condition_values,yield_values=spec
+        def scalars(names,kinds,local):
+            values=tuple(self.value(v,local) for v in names)
+            if any(isinstance(v,Buffer) or dtype(scalar_type(v))!=dtype(t)
+                   for v,t in zip(values,kinds)):
+                raise Unsupported(f'L{node.line}: scf.while 实际值与标量类型不符')
+            return values
+        carried=scalars((init for _,init in pairs),ins,env)
+        while True:
+            before=dict(env)
+            before.update(zip((name for name,_ in pairs),carried))
+            self.sequence(node.body[:-1],before)
+            self.budget.tick()  # scf.condition (even a no-value empty loop is bounded)
+            take_after=while_test(self.value(test,before))
+            forwarded=scalars(condition_values,outs,before)
+            if not take_after:
+                env.update(zip(result_names,forwarded))
+                return
+            after=dict(env)
+            after.update(zip(after_names,forwarded))
+            self.sequence(body[:-1],after)
+            self.budget.tick()  # scf.yield
+            carried=scalars(yield_values,ins,after)
+
     def operation(self, node, env):
         original, line = node.text, node.line
+        if line in self.while_specs:
+            return self.execute_while(node,env,self.while_specs[line])
         assignment = re.match(rf"^({SSA})\s*=\s*(.*)", original)
         target = assignment[1] if assignment else None
         text = assignment[2] if assignment else original

@@ -8,7 +8,7 @@ import numpy as np
 from .capabilities import MLIR_BATCH_CASTS, MLIR_BATCH_SCALARS, MLIR_MATMUL
 from .execution import (Buffer,Budget,Expr,SemanticFault,Unsupported,apply,cast,dtype,
                         select,storage_type,trace_value,mlir_cast,mlir_cmpi,mlir_cmpf,
-                        MLIR_CMPF_PREDICATES,scalar_op,concrete_index)
+                        MLIR_CMPF_PREDICATES,scalar_op,concrete_index,while_test)
 from .tile_ops import (accumulate_matrix, matmul_shape, matrix_transposes,
                        parse_matrix_map, reduction_details)
 
@@ -41,9 +41,9 @@ class MLIRObjectInterpreter:
             'func.func','func.return','arith.constant','arith.cmpi','arith.cmpf','arith.select',
             'memref.alloc','memref.alloca','memref.load','memref.store','memref.dim',
             'memref.copy','memref.subview','memref.reinterpret_cast','scf.for','scf.parallel','scf.if','scf.yield',
-            'scf.reduce','linalg.fill','linalg.yield'}
+            'scf.while','scf.condition','scf.reduce','linalg.fill','linalg.yield'}
         with self.context:
-            def inspect(op,path):
+            def inspect(op,path,parent=None,region=None):
                 op=op.operation;self.paths[op]=path
                 if op.name not in allowed: raise Unsupported(f'{path}: 未支持官方 MLIR 操作 {op.name}（包括未执行分支）')
                 attrs={a if isinstance(a,str) else a.name for a in op.attributes}
@@ -66,12 +66,17 @@ class MLIRObjectInterpreter:
                     raise Unsupported(f'{path}: 带归约结果的 scf.parallel 尚未支持')
                 if op.name=='scf.reduce' and (len(op.operands) or len(op.regions)):
                     raise Unsupported(f'{path}: 非空 scf.reduce 尚未支持')
+                if op.name=='scf.while':
+                    self.inspect_while(op,path)
+                if op.name=='scf.condition' and (parent,region)!=('scf.while',0):
+                    raise Unsupported(f'{path}: scf.condition 只允许在 scf.while 的 before 区域')
                 if op.name in MLIR_MATMUL:
                     self.matmul_specs[op]=self.inspect_matmul(op,path)
                 for ri,r in enumerate(op.regions):
                     if len(r.blocks)>1: raise Unsupported(f'{path}: 多 block/CFG 尚未支持')
                     for bi,b in enumerate(r.blocks):
-                        for oi,child in enumerate(b.operations): inspect(child,f'{path}.r{ri}.b{bi}.op{oi}')
+                        for oi,child in enumerate(b.operations):
+                            inspect(child,f'{path}.r{ri}.b{bi}.op{oi}',op.name,ri)
             inspect(self.function,'function')
 
     def location(self,op):
@@ -162,6 +167,32 @@ class MLIRObjectInterpreter:
             raise Unsupported(f'{path}: matmul body 只支持纯标量指令及一个 C 类型的 yield')
         return ta,tb,block,kinds
 
+    def inspect_while(self,op,path):
+        # SCF admits different types/counts on the two edges of the cycle.
+        # before operands == initial values; after operands == loop results.
+        if len(op.regions)!=2 or any(len(r.blocks)!=1 for r in op.regions):
+            raise Unsupported(f'{path}: scf.while 需要各含一个 block 的 before/after 区域')
+        before,after=(r.blocks[0] for r in op.regions)
+        def terminator(block,name):
+            ops=[v.operation for v in block.operations]
+            if not ops or ops[-1].name!=name:
+                raise Unsupported(f'{path}: scf.while 缺少 {name}')
+            return ops[-1]
+        condition=terminator(before,'scf.condition')
+        yielded=terminator(after,'scf.yield')
+        if not len(condition.operands) or str(condition.operands[0].type)!='i1':
+            raise Unsupported(f'{path}: scf.condition 需要 i1')
+        def types(values): return tuple(v.type for v in values)
+        if (types(op.operands)!=types(before.arguments) or types(yielded.operands)!=types(op.operands)
+                or types(op.results)!=types(after.arguments)
+                or types(tuple(condition.operands)[1:])!=types(op.results)):
+            raise Unsupported(f'{path}: scf.while 两条传值路径的参数或结果不匹配')
+        for v in itertools.chain(op.operands,op.results):
+            if isinstance(v.type,self.ir.MemRefType):
+                self.memtype(v.type)
+            else:
+                self.kind(v.type)
+
     def value(self,value,env):
         if value not in env: raise Unsupported('官方 SSA 值未绑定')
         return env[value]
@@ -194,7 +225,8 @@ class MLIRObjectInterpreter:
     def operation(self,op,env,line):
         name=op.name
         operands=[self.value(a,env) for a in op.operands]
-        if name in {'scf.yield','func.return','linalg.yield','scf.reduce'}: return (name,tuple(operands))
+        if name in {'scf.condition','scf.yield','func.return','linalg.yield','scf.reduce'}:
+            return (name,tuple(operands))
         if name=='scf.for':
             lo,hi,step=map(int,operands[:3]);carried=tuple(operands[3:])
             if step<=0: raise Unsupported('scf.for 需要正步长')
@@ -205,6 +237,27 @@ class MLIRObjectInterpreter:
                 if yielded is None or yielded[0]!='scf.yield': raise Unsupported('scf.for 缺少 yield')
                 carried=yielded[1]
             values=carried
+        elif name=='scf.while':
+            before,after=(r.blocks[0] for r in op.regions)
+            carried=operands
+            while True:
+                local=dict(env)
+                local.update(zip(before.arguments,carried))
+                # sequence charges the common Budget, including the terminator
+                # itself. Even an otherwise empty cycle cannot run unbounded.
+                condition=self.sequence(before,local)
+                if condition is None or condition[0]!='scf.condition':
+                    raise Unsupported('scf.while 缺少 scf.condition')
+                test,*forwarded=condition[1]
+                if not while_test(test):
+                    values=forwarded
+                    break
+                local=dict(env)
+                local.update(zip(after.arguments,forwarded))
+                yielded=self.sequence(after,local)
+                if yielded is None or yielded[0]!='scf.yield':
+                    raise Unsupported('scf.while 缺少 scf.yield')
+                carried=yielded[1]
         elif name=='scf.parallel':
             block=op.regions[0].blocks[0];n=len(block.arguments)
             lo,hi,step=operands[:n],operands[n:2*n],operands[2*n:]

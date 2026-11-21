@@ -67,5 +67,5 @@ MLIR_OPS = set(MLIR_BATCH_SCALARS) | MLIR_BATCH_CASTS | MLIR_BATCH2_OPS | {"memr
     "arith.constant", "arith.index_cast", "arith.index_castui", "arith.extsi", "arith.extui", "arith.trunci", "arith.uitofp", "arith.addi", "arith.subi", "arith.muli",
     "arith.addf", "arith.subf", "arith.mulf", "arith.divf",
     "memref.copy", "arith.negf", "arith.cmpf", "arith.floordivsi", "arith.remsi", "arith.sitofp", "math.exp", "math.exp2", "math.absf", "math.rsqrt", "math.sqrt", "memref.subview", "arith.cmpi", "arith.extf", "arith.truncf", "arith.select", "linalg.fill",
-    "scf.for", "scf.parallel", "scf.if", "scf.yield", "scf.reduce", "return"}
+    "scf.for", "scf.parallel", "scf.if", "scf.while", "scf.condition", "scf.yield", "scf.reduce", "return"}
 LOW_PRECISION = {"bf16", "bfloat16", "f16", "float16", "f8E4M3FN", "float8_e4m3fn"}

@@ -29,6 +29,15 @@ class LoopBreak(Exception):
     """Internal statement control signal, caught by the nearest serial For."""
 
 
+def while_test(condition):
+    """SCF control flow needs a concrete i1; never choose a symbolic path."""
+    if isinstance(condition, Expr):
+        raise Unsupported('数据相关符号 scf.while 条件；仅执行具体输入')
+    if not isinstance(condition, (bool, np.bool_)):
+        raise Unsupported('scf.condition 需要 i1')
+    return bool(condition)
+
+
 def dtype(name):
     aliases = {"f32": "float32", "f64": "float64", "i1": "bool", "index": "int64"}
     if name in ("f8E4M3FN", "float8_e4m3fn"):
