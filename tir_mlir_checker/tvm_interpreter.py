@@ -8,11 +8,16 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from copy import copy
 
+from math import prod
+
 import numpy as np
 
 from .capabilities import (TIR_BATCH2_TILES,TIR_BATCH_SCALARS,TIR_BREAKS,TIR_CUMSUM,TIR_EXTERN,
                            TIR_SERIAL_MARKERS,TIR_TAIL_STATEMENTS,TIR_TUPLE)
 from .execution import Buffer, Budget, Expr, LoopBreak, SemanticFault, Unsupported, apply, cast, concrete_index, dtype, extern_scalar, select, tir_scalar
+from .tir_riscv_contracts import (ACCESS, ADDRESS, ATOMIC_LOAD, ATOMIC_STORE, INT, PTYPE,
+                                  SCALAR, SHUFFLES, STREAM_SCALAR, STREAM_VECTOR,
+                                  PointerView, shuffle_source, stream_words)
 from .tir_tail_contracts import SWIZZLE_ATTR, WARP_FENCE, extern_error, marker_error, tuple_error
 from .tile_ops import (GEMM_OPS, accumulate_matrix, check_hints, copy_region, cumsum_region, fill_region,
                        gemm_controls, gemm_view, matmul_shape, matrix_step, reduction_details,
@@ -41,15 +46,23 @@ class TVMInterpreter:
             'For','IfThenElse','BufferStore','Evaluate','AttrStmt','Block','BlockRealize','BufferRegion','Range'}
         calls = set(self.calls) | set(TIR_BATCH_SCALARS) | TIR_BATCH2_TILES | TIR_TAIL_STATEMENTS | {self.storage_sync,TIR_EXTERN,'tir.if_then_else','tir.assume',
             'tl.tileop.region','tl.tileop.copy','tl.tileop.reduce'}
+        calls |= set(SHUFFLES) | {ADDRESS, ACCESS, PTYPE, ATOMIC_LOAD, ATOMIC_STORE}
+        self.pointer_buffers = {}
         self.layout_owners = {}
+        has_p2_call = False
         gaps,tail_nodes,standalone,blocks,accessed=set(),{},set(),[],{}
         def preflight(node):
+            nonlocal has_p2_call
             kind = type(node).__name__
             if kind not in allowed:
                 gaps.add(f'TIR node {kind} 尚未支持')
             if kind in {'BufferLoad','BufferStore'}:
                 accessed[self.key(node.buffer)] = node.buffer
             op = self.op_name(node)
+            if (op in SHUFFLES or op in {ADDRESS,ACCESS,PTYPE,ATOMIC_LOAD,ATOMIC_STORE,'tl.ieee_frcp'}
+                    or op==TIR_EXTERN and len(node.args)
+                    and self.constant(node.args[0]) in STREAM_SCALAR | STREAM_VECTOR):
+                has_p2_call = True
             if kind == 'Call' and op not in calls:
                 gaps.add(f'TIR Call {op or node.op} 尚未支持（包括未执行分支）')
             if op in TIR_TAIL_STATEMENTS or op==TIR_EXTERN:
@@ -98,6 +111,14 @@ class TVMInterpreter:
                 except Unsupported as exc:
                     gaps.add(str(exc))
         tvm.tir.stmt_functor.post_order_visit(function.body,preflight)
+        self.shuffle_sites = {}
+        self.stream_launches = set()
+        self.p2_replay = False
+        if has_p2_call:
+            try:
+                self.inspect_riscv_calls(function.body)
+            except Unsupported as exc:
+                gaps.add(str(exc))
         for key, buf in accessed.items():
             owner = self.layout_owners.get(self.key(buf.data),key)
             if owner != key:
@@ -111,8 +132,10 @@ class TVMInterpreter:
             if key not in standalone: gaps.add(f'{op}: 仅支持 Evaluate 或允许的元数据，不能用作值')
         self.sync_subtrees = set()
         self.cooperative_launches = set()
+        self.launch_shuffle_sites = {}
         self.block_launches_with_sync = set()
-        if self.storage_sync in tail_nodes.values():
+        self.p2_replay = bool(self.shuffle_sites or self.stream_launches)
+        if self.storage_sync in tail_nodes.values() or self.p2_replay:
             try: self.inspect_sync_tree(function.body)
             except Unsupported as exc: gaps.add(str(exc))
         # Throw outside the FFI callback so TVM does not wrap Unsupported as an
@@ -242,7 +265,8 @@ class TVMInterpreter:
     def inspect_sync_tree(self, root):
         def mark(node):
             children = [mark(child) for _, child in self.statement_children(node)]
-            if any(children) or self.is_sync(node):
+            if (any(children) or self.is_sync(node) or self.key(node) in self.shuffle_sites
+                    or self.key(node) in self.stream_launches):
                 self.sync_subtrees.add(self.key(node))
                 return True
             return False
@@ -265,6 +289,10 @@ class TVMInterpreter:
                 if tag != 'threadIdx.x' or type(extent) is not int or not 2 <= extent <= 1024:
                     raise Unsupported(f'{self.storage_sync}: 仅分相静态单一 threadIdx.x（2..1024）')
                 self.inspect_cooperation(node.body)
+                sites = self.subtree_shuffle_sites(node.body)
+                self.launch_shuffle_sites[self.key(node)] = sites
+                if sites and extent % 32:
+                    raise Unsupported('Warp shuffle: threadIdx.x 需要完整的 32-lane warp')
                 self.cooperative_launches.add(self.key(node))
                 self.block_launches_with_sync.update(blocks)
                 return
@@ -272,6 +300,11 @@ class TVMInterpreter:
                 inspect(child, blocks)
 
         inspect(root)
+        covered = set()
+        for launch in self.cooperative_launches:
+            covered.update(self.launch_shuffle_sites.get(launch, ()))
+        if self.shuffle_sites.keys() - covered:
+            raise Unsupported('Warp shuffle: 需要静态、完整且单一的 threadIdx.x 域')
 
     def inspect_cooperation(self, root):
         buffers = {self.key(b) for b in self.fun.buffer_map.values()}
@@ -284,10 +317,15 @@ class TVMInterpreter:
             if self.key(node) not in self.sync_subtrees:
                 return
             kind = type(node).__name__
-            if kind == 'IfThenElse': fail('多物理线程条件分支内的屏障尚未支持')
+            if kind == 'IfThenElse':
+                if self.subtree_shuffle_sites(node):
+                    raise Unsupported('Warp shuffle: 条件分支不能保证一致到达')
+                fail('多物理线程条件分支内的屏障尚未支持')
             if kind == 'For':
                 step = getattr(node,'step',None)
-                if (int(node.kind) != 0 or type(self.constant(node.min)) is not int
+                loop_kind = int(node.kind)
+                warp_loop = bool(self.subtree_shuffle_sites(node))
+                if (loop_kind not in ({0,3} if warp_loop else {0}) or type(self.constant(node.min)) is not int
                         or type(self.constant(node.extent)) is not int or self.constant(node.extent) < 0
                         or step is not None and self.constant(step) != 1):
                     fail('多物理线程循环内的屏障需要静态一致、单位步长的串行循环')
@@ -301,8 +339,8 @@ class TVMInterpreter:
             elif kind == 'For':
                 loop_kind = int(node.kind)
                 step = getattr(node,'step',None)
-                if loop_kind not in {0, 3} and (loop_kind != 1 or self.constant(node.extent) != 1
-                                              or len(node.annotations)):
+                if (loop_kind not in {0,3} and not self.vector_copy_loop(node)
+                        and (loop_kind != 1 or self.constant(node.extent) != 1 or len(node.annotations))):
                     fail('物理线程分相内的逻辑并行布局/向量循环尚未建模')
                 self.check_for_metadata(node, '物理线程分相')
                 if step is not None and self.constant(step) != 1:
@@ -313,7 +351,7 @@ class TVMInterpreter:
                 if tag:
                     if tag not in {'threadIdx.y','threadIdx.z'} or self.constant(node.value) != 1:
                         fail('多维、重复或嵌套的非单位线程启动尚未建模')
-                elif str(node.attr_key) != 'tl.assume':
+                elif str(node.attr_key) != 'tl.assume' and not self.is_launch_hint(node):
                     fail(f'物理线程分相内未支持 AttrStmt {node.attr_key}')
             elif kind == 'BlockRealize':
                 if self.constant(node.predicate) is not True or len(node.iter_values):
@@ -333,7 +371,7 @@ class TVMInterpreter:
                     elif scope not in {'local','local.var'}:
                         fail(f'物理线程分相内未建模的分配作用域 {scope}')
                     buffers.add(bkey)
-            elif has_sync and not self.is_sync(node) and kind not in {'SeqStmt','LetStmt'}:
+            elif has_sync and not self.is_sync(node) and self.key(node) not in self.shuffle_sites and kind not in {'SeqStmt','LetStmt'}:
                 fail(f'无法确定 {kind} 中的屏障到达顺序')
             for _, child in self.statement_children(node):
                 visit(child, uniform)
@@ -353,12 +391,216 @@ class TVMInterpreter:
         self.tvm.tir.stmt_functor.post_order_visit(root, effects)
         if problems: fail(sorted(problems)[0])
 
+    @classmethod
+    def expression_children(cls, node):
+        kind = type(node).__name__
+        fields = {
+            'BufferLoad':('indices','predicate'), 'BufferStore':('indices','predicate','value'),
+            'Let':('value','body'), 'LetStmt':('value',), 'Cast':('value',),
+            'For':('min','extent','step'), 'AttrStmt':('value',),
+            'IfThenElse':('condition',), 'Select':('condition','true_value','false_value'),
+            'BlockRealize':('predicate','iter_values'), 'Evaluate':('value',),
+            'Not':('a',), 'Ramp':('base','stride','lanes'), 'Call':('args',),
+        }.get(kind,('a','b') if kind in cls.binary else ())
+        for field in fields:
+            expr = getattr(node,field,None)
+            if expr is None:
+                continue
+            if field in {'indices','iter_values','args'}:
+                yield from ((i,child) for i,child in enumerate(expr))
+            else:
+                yield field,expr
+
+    def check_stream(self, node, symbol):
+        vector = symbol in STREAM_VECTOR
+        operands = node.args[1:]
+        if len(operands) != (2 if vector else 1) or any(self.op_name(x)!=ADDRESS for x in operands):
+            raise Unsupported(f'{symbol}: 需要直接的 address_of(BufferLoad) 参数')
+        if any(len(x.args)!=1 or type(x.args[0]).__name__!='BufferLoad' for x in operands):
+            raise Unsupported(f'{symbol}: 地址参数必须是标量 BufferLoad')
+        types = [str(x.args[0].buffer.dtype) for x in operands]
+        if any(t not in SCALAR for t in types):
+            raise Unsupported(f'{symbol}: 仅支持可按字节访问的标量 Buffer')
+        if not vector and (types[0] != str(node.dtype) or dtype(types[0]).itemsize not in (2,4)
+                           or symbol == 'tileops::load_f32_evict_last' and types[0] != 'float32'):
+            raise Unsupported(f'{symbol}: 需要匹配的 16/32 位标量类型')
+
+    def inspect_riscv_calls(self, root):
+        def lane_dependent_expr(expr, dependent):
+            if type(expr).__name__ in {'BufferLoad','Let'}:
+                return True
+            if type(expr).__name__ in {'Var','SizeVar'}:
+                return self.key(expr) in dependent
+            return any(lane_dependent_expr(child,dependent) for _,child in self.expression_children(expr))
+
+        def walk(node, owners, stmt=None, slot=None, guarded=False, concurrent=False,
+                 parent=None, launch=None, lane_dependent=frozenset()):
+            kind,op = type(node).__name__,self.op_name(node)
+            if stmt is None:
+                stmt = node
+            if kind == 'Block':
+                owners = dict(owners)
+                for buf in node.alloc_buffers:
+                    k = self.key(buf.data)
+                    if k in owners:
+                        owners[k] = None  # ambiguous; never guess a descriptor
+                    else:
+                        owners[k] = buf
+            tag = self.thread_tag(node)
+            if tag and self.constant(node.value)!=1:
+                concurrent = True
+                if tag == 'threadIdx.x' and launch is None:
+                    launch = node
+                    lane_dependent = lane_dependent | {self.key(node.node.var)}
+            if kind=='For' and int(node.kind) in {1,2,4} and self.constant(node.extent)!=1:
+                concurrent = True
+            if op == 'tl.ieee_frcp':
+                if (len(node.args)!=2 or self.constant(node.args[1])!='rn'
+                        or str(node.dtype) not in {'float32','float64'} or node.args[0].dtype!=node.dtype):
+                    raise Unsupported('tl.ieee_frcp: 需要同类型 f32/f64 标量及字面量 rn')
+            if op == TIR_EXTERN and len(node.args):
+                symbol = self.constant(node.args[0])
+                if symbol in STREAM_VECTOR | STREAM_SCALAR:
+                    self.check_stream(node,symbol)
+                    if launch is not None:
+                        self.stream_launches.add(self.key(launch))
+                    if symbol in STREAM_VECTOR and (type(parent).__name__!='Evaluate' or slot!='value'):
+                        raise Unsupported(f'{symbol}: 16 字节写入必须是独立 Evaluate')
+            if op in {ATOMIC_LOAD, ATOMIC_STORE}:
+                required = 1 if op==ATOMIC_LOAD else 2
+                if (concurrent or len(node.args) not in {required,required+1}
+                        or self.op_name(node.args[0]) != ACCESS
+                        or len(node.args)>required and (type(self.constant(node.args[-1])) is not int
+                            or self.constant(node.args[-1]) not in ({0,1,2,5} if op==ATOMIC_LOAD else {0,3,5}))
+                        or op==ATOMIC_STORE and (type(parent).__name__!='Evaluate' or slot!='value'
+                            or str(node.args[1].dtype) not in SCALAR)
+                        or op==ATOMIC_LOAD and str(node.dtype) not in SCALAR):
+                    raise Unsupported(f'{op}: 只支持无并发的有界标量访存、已知内存顺序')
+            if op == PTYPE and (self.op_name(parent)!=ACCESS or slot!=0):
+                raise Unsupported(f'{PTYPE}: 仅可作 tvm_access_ptr 的元素类型')
+            if op == ACCESS:
+                if self.op_name(parent) not in {ATOMIC_LOAD,ATOMIC_STORE} or slot!=0:
+                    raise Unsupported(f'{ACCESS}: 未建模的消费点 {self.op_name(parent) or type(parent).__name__}')
+                args = node.args
+                if (len(args)!=5 or str(node.dtype)!='handle' or self.op_name(args[0])!=PTYPE
+                        or len(args[0].args) or type(args[1]).__name__!='Var'
+                        or str(args[2].dtype) not in INT or type(self.constant(args[3])) is not int
+                        or self.constant(args[3])!=1 or type(self.constant(args[4])) is not int
+                        or self.constant(args[4]) not in (1,2,3)):
+                    raise Unsupported(f'{ACCESS}: 需要明确的标量类型、Buffer.data、整数 offset、extent=1、rw_mask 1/2/3')
+                buf = owners.get(self.key(args[1]))
+                if buf is None or not buf.data.same_as(args[1]) or buf.dtype!=args[0].dtype:
+                    raise Unsupported(f'{ACCESS}: 无法解析同类型、唯一且在作用域内的根 Buffer')
+                if not self.constant(args[4]) & (1 if self.op_name(parent)==ATOMIC_LOAD else 2):
+                    raise Unsupported(f'{ACCESS}: rw_mask 与消费操作不符')
+                self.check_pointer_buffer(buf)
+                self.pointer_buffers[self.key(node)] = buf
+            if op == ADDRESS:
+                sym = self.constant(parent.args[0]) if self.op_name(parent)==TIR_EXTERN and len(parent.args) else None
+                if (sym not in STREAM_VECTOR | STREAM_SCALAR
+                        or slot not in ({1,2} if sym in STREAM_VECTOR else {1})):
+                    raise Unsupported(f'{ADDRESS}: 未建模的消费点 {self.op_name(parent) or type(parent).__name__}')
+                if (len(node.args)!=1 or str(node.dtype)!='handle'
+                        or type(load:=node.args[0]).__name__!='BufferLoad'
+                        or getattr(load,'predicate',None) is not None
+                        or any(str(i.dtype) not in INT for i in load.indices)):
+                    raise Unsupported(f'{ADDRESS}: 需要无谓词的标量 BufferLoad')
+                buf = owners.get(self.key(load.buffer.data))
+                if buf is None or not buf.same_as(load.buffer):
+                    raise Unsupported(f'{ADDRESS}: Buffer 别名或作用域无法确定')
+                self.check_pointer_buffer(buf)
+            if op in SHUFFLES:
+                if guarded or type(stmt).__name__ not in {'BufferStore','LetStmt'}:
+                    raise Unsupported(f'Warp shuffle {op}: 仅支持一致到达的存储 RHS 或 LetStmt')
+                if self.key(stmt) in self.shuffle_sites:
+                    raise Unsupported('Warp shuffle: 同一语句中只支持一个交换点')
+                args = node.args
+                if (len(args) not in (4,5) or str(node.dtype) not in SCALAR | {'bool'}
+                        or str(args[1].dtype) != str(node.dtype)
+                        or str(args[0].dtype) not in {'int32','uint32','int64','uint64'}
+                        or str(args[2].dtype) not in INT or type(self.constant(args[3])) is not int
+                        or not 1 <= self.constant(args[3]) <= 32
+                        or len(args)==5 and self.constant(args[4])!=32):
+                    raise Unsupported(f'Warp shuffle {op}: 非法标量类型、mask、静态 width 或 warp_size')
+                if SHUFFLES[op]!='idx' and lane_dependent_expr(args[2],lane_dependent):
+                    raise Unsupported('Warp shuffle: xor/up/down 的 delta 不能依赖物理 lane 或访存')
+                width = self.constant(args[3])
+                # The lowerer shifts an i32 mask by candidate_lane even when
+                # its predicate is false. Reject widths with incomplete subgroups.
+                if 32 % width:
+                    raise Unsupported('Warp shuffle: width 必须整除 32，避免掩码移位越界')
+                # The source lowering may read a snapshot at the candidate lane
+                # using current-lane indices. Admit only unambiguous direct loads
+                # with static indices (or literal operands) in the initial model.
+                payload = args[1]
+                if not (type(payload).__name__ in {'IntImm','FloatImm'} or
+                        type(payload).__name__=='BufferLoad'
+                        and getattr(payload,'predicate',None) is None
+                        and all(type(self.constant(i)) is int for i in payload.indices)):
+                    raise Unsupported('Warp shuffle: 仅重放标量常量或固定坐标的直接 BufferLoad')
+                self.shuffle_sites[self.key(stmt)] = node,width
+
+            for field,child in self.expression_children(node):
+                # Values hoisted for replay may not be taken from lazy
+                # branches, expression-local bindings or statement indices.
+                hidden = (guarded or kind in {'Let','Select','IfThenElse','For','AttrStmt','BlockRealize','BufferLoad'}
+                          or kind=='BufferStore' and field!='value'
+                          or op in SHUFFLES or op=='tir.if_then_else')
+                walk(child,owners,stmt,field,hidden,concurrent,node,launch,lane_dependent)
+            if kind=='LetStmt' and launch is not None and lane_dependent_expr(node.value,lane_dependent):
+                lane_dependent = lane_dependent | {self.key(node.var)}
+            for _,child in self.statement_children(node):
+                # Let expression bodies are handled above as expressions,
+                # not as independent statements.
+                if stmt is node:
+                    walk(child,owners,concurrent=concurrent,launch=launch,lane_dependent=lane_dependent)
+
+        walk(root,{self.key(b.data):b for b in self.fun.buffer_map.values()})
+
+    def check_pointer_buffer(self, buf):
+        if (str(buf.dtype) not in SCALAR or not len(buf.shape) or len(buf.axis_separators)
+                or self.constant(buf.elem_offset)!=0 or self.key(buf.data) in self.layout_owners):
+            raise Unsupported('有界引用需要确定的紧凑标量 Buffer；不支持物理布局重映射或 elem_offset')
+        if len(buf.strides):
+            shape = tuple(map(self.constant,buf.shape))
+            if (any(type(n) is not int or n<0 for n in shape)
+                    or tuple(map(self.constant,buf.strides))!=tuple(prod(shape[i+1:]) for i in range(len(shape)))):
+                raise Unsupported('有界引用不支持动态或非紧凑 stride')
+
+    def pointer(self, node, path, *, extent=None, mask=None):
+        op = self.op_name(node)
+        self.budget.tick()
+        if op == ADDRESS and extent is not None:
+            load = node.args[0]
+            buf = self.buffers.get(self.key(load.buffer))
+            if buf is None:
+                raise Unsupported(f'{path}: address_of Buffer 不在当前作用域')
+            indices = tuple(concrete_index(self.expr(i,path+'.index')) for i in load.indices)
+            indices = buf.index(indices,0,'write' if mask==2 else 'read')
+            offset = sum(a*b for a,b in zip(indices,buf.element_strides))
+        elif op == ACCESS and not self.nonunit_threads and not self.budget.parallel and self.key(node) in self.pointer_buffers:
+            spec = self.pointer_buffers[self.key(node)]
+            buf = self.buffers.get(self.key(spec))
+            if buf is None:
+                raise Unsupported(f'{path}: access_ptr Buffer 不在当前作用域')
+            offset = concrete_index(self.expr(node.args[2],path+'.offset'))
+            extent,mask = map(self.constant,node.args[3:5])
+        else:
+            raise Unsupported(f'{path}: 有界引用仅用于已建模的消费点')
+        return PointerView(buf,offset,extent,mask)
+
+    def subtree_shuffle_sites(self, node):
+        return ({self.key(node)} if self.key(node) in self.shuffle_sites else set()).union(
+            *(self.subtree_shuffle_sites(child) for _,child in self.statement_children(node)))
+
     def tail_error(self,node,op,metadata=False):
         if getattr(node,'annotations',None):
             return f'{op}: 不支持附加注解'
         args=node.args
         vals=[self.constant(a) for a in args]
         if op==TIR_EXTERN:
+            if vals and vals[0] in STREAM_SCALAR | STREAM_VECTOR:
+                return None  # Full typed/context checks in inspect_riscv_calls.
             return extern_error(vals,str(node.dtype),[str(getattr(a,'dtype','')) for a in args[1:]])
         if op in TIR_BREAKS and args:
             return f'{op}: 不接受参数'
@@ -432,7 +674,17 @@ class TVMInterpreter:
                 else: self.env[key] = old
         if kind == "Call":
             op = getattr(node.op,"name",None)
+            if op in SHUFFLES:
+                if self.key(node) not in self.shuffle_values:
+                    raise Unsupported(f'{path}: Warp shuffle 只能在一致到达的重放点执行')
+                return self.shuffle_values[self.key(node)]
+            if op == ATOMIC_LOAD:
+                return cast(self.pointer(node.args[0], path).read(0), str(node.dtype))
             if op==TIR_EXTERN:
+                symbol = self.constant(node.args[0]) if len(node.args) else None
+                if symbol in STREAM_SCALAR:
+                    self.check_stream(node, symbol)
+                    return self.pointer(node.args[1],path,extent=1,mask=1).read(0)
                 problem=self.tail_error(node,op)
                 if problem: raise Unsupported(problem)
                 values=[self.expr(a,path+f'.args[{i}]') for i,a in enumerate(node.args[1:],1)]
@@ -535,7 +787,21 @@ class TVMInterpreter:
                               lambda details:self.reductions.append({**self.location(node,path),**details}))
                 self.event(node,path,action='tile_cumsum',operation=op)
                 return
+        if op == ATOMIC_STORE:
+            target = self.pointer(args[0],path)
+            write(target.buffer,target.index(0,'write'),cast(self.expr(args[1],path),target.buffer.dtype.name),0)
+            return
         if op==TIR_EXTERN:
+            symbol = self.constant(args[0]) if len(args) else None
+            if symbol in STREAM_VECTOR:
+                self.check_stream(node,symbol)
+                dst_bits,src_bits = (dtype(str(a.args[0].dtype)).itemsize for a in args[1:])
+                target = self.pointer(args[1],path,extent=16//dst_bits,mask=2)
+                source = self.pointer(args[2],path,extent=16//src_bits,mask=1)
+                for i,value in enumerate(stream_words(source,target)):
+                    write(target.buffer,target.index(i,'write'),value,0)
+                self.event(node,path,action='stream_copy_16_bytes',operation=symbol)
+                return
             self.expr(node,path)
             return
 
@@ -681,8 +947,33 @@ class TVMInterpreter:
         if dt not in ('int32','int64') or footprint > 1 << (int(dt[3:])-1):
             raise Unsupported(f'{path}: layout_map 物理索引类型非法或溢出')
 
+    def is_launch_hint(self, node):
+        # CUDA occupancy hint. The RISC-V AttrStmt visitor only visits its body.
+        return (self.p2_replay and str(node.attr_key)=='tl.min_blocks_per_sm'
+                and type(self.constant(node.value)) is int and self.constant(node.value)>0)
+
+    def vector_copy_loop(self, node):
+        if (not self.p2_replay or int(node.kind)!=2 or len(node.annotations)
+                or getattr(node,'thread_binding',None) is not None
+                or (getattr(node,'step',None) is not None and self.constant(node.step)!=1)
+                or type(node.body).__name__!='BufferStore'
+                or type(node.body.value).__name__!='BufferLoad'):
+            return False
+        store,load = node.body,node.body.value
+        return (getattr(store,'predicate',None) is None and getattr(load,'predicate',None) is None
+                and str(store.buffer.dtype) in SCALAR and store.buffer.dtype==load.buffer.dtype
+                and all(str(i.dtype) in INT for i in (*store.indices,*load.indices)))
+
     def check_for_metadata(self, node, path):
         if not len(node.annotations):
+            return
+        # RISC-V lowers unrolled loops in original iteration order; this
+        # recognized TVMScript flag only controls explicit code expansion.
+        if (int(node.kind)==3 and set(map(str,node.annotations.keys())) == {'pragma_unroll_explicit'}
+                and self.p2_replay
+                and (type(node.annotations['pragma_unroll_explicit']) is bool
+                     or type(self.constant(node.annotations['pragma_unroll_explicit'])) is bool)
+                and (getattr(node,'step',None) is None or self.constant(node.step)==1)):
             return
         # One pipeline stage preserves the serial loop order in LowerLoopBody.
         # No dependence on pipeline prologues or overlapping stages is modeled.
@@ -750,19 +1041,42 @@ class TVMInterpreter:
             lane.loop_specs, lane.loop_stack = dict(self.loop_specs), list(self.loop_stack)
             lane.env[self.key(var)] = cast(tid, str(var.dtype))
             lane.phase_shared = shared
+            lane.shuffle_values = {}
             lane.nonunit_threads += 1
             lanes.append(lane.cooperate(node.body, path+'.body'))
         finished = object()
+        incoming = [None]*extent
+        region = self.budget.new_region()
         try:
             while True:
-                region = self.budget.new_region()
                 arrivals = []
                 for tid,lane in enumerate(lanes):
                     with self.budget.iteration(region,tid):
-                        arrivals.append(next(lane, finished))
-                if all(x is finished for x in arrivals): return
-                if any(x != arrivals[0] for x in arrivals[1:]):
-                    raise SemanticFault('物理线程没有全部到达同一屏障', rule_id='SYNC-DIVERGENT-BARRIER')
+                        try:
+                            arrivals.append(lane.send(incoming[tid]))
+                        except StopIteration:
+                            arrivals.append(finished)
+                if all(x is finished for x in arrivals):
+                    return
+                if any(x is finished for x in arrivals) or any(x[:2] != arrivals[0][:2] for x in arrivals):
+                    raise SemanticFault('物理线程没有全部到达同一重放点', rule_id='SYNC-DIVERGENT-BARRIER')
+                kind = arrivals[0][0]
+                if kind == 'barrier':
+                    if any(x != arrivals[0] for x in arrivals):
+                        raise SemanticFault('物理线程屏障作用域不一致', rule_id='SYNC-DIVERGENT-BARRIER')
+                    region = self.budget.new_region()
+                    incoming = [None]*extent
+                else:
+                    # A warp exchange is NOT a shared-memory barrier: retain
+                    # this phase's access history when resuming the lanes.
+                    incoming = []
+                    for tid,(_,_,mode,mask,arg,width,mask_bits,_) in enumerate(arrivals):
+                        warp0 = tid//32*32
+                        other = arrivals[warp0]
+                        if mask != other[3] or (mode != 'idx' and arg != other[4]):
+                            raise Unsupported('Warp shuffle: 各 lane 的 mask 或 delta 不一致')
+                        source = shuffle_source(mode,tid,extent,arg,width,mask,mask_bits)
+                        incoming.append(arrivals[source][-1])
         finally:
             for lane in lanes: lane.close()
 
@@ -775,9 +1089,35 @@ class TVMInterpreter:
         if self.is_sync(node):
             scope = self.sync_scope(node.value)
             self.event(node,path,action='thread_phase_barrier',scope=scope)
-            yield (path,scope)
+            yield ('barrier',path,scope)
             return
         kind = type(node).__name__
+        site = self.shuffle_sites.get(self.key(node))
+        if site is not None:
+            # Read all lane values before any lane can commit this statement.
+            call, width = site
+            args = call.args
+            with self.budget.at('tvm_node',0,**self.location(call,path+'.value')):
+                mask_bits = dtype(str(args[0].dtype)).itemsize*8
+                mask = concrete_index(self.expr(args[0],path+'.mask')) & ((1 << mask_bits)-1)
+                if mask >> 32:
+                    raise Unsupported('Warp shuffle: 参与掩码只能使用低 32 位')
+                amount = concrete_index(self.expr(args[2],path+'.lane'))
+                mode = SHUFFLES[self.op_name(call)]
+                # AsIndex sign-extends signed operands, zero-extends unsigned
+                # operands. Negative bit patterns are unsigned for RemUI.
+                amount &= 0xffffffff if mode == 'xor' else (1<<64)-1
+                if mode in {'up','down'} and amount >= 1<<63:
+                    raise Unsupported('Warp shuffle: up/down 需要非负、无溢出的 lane delta')
+                value = cast(self.expr(args[1],path+'.payload'),str(call.dtype))
+            result = yield ('shuffle',path,mode,mask,amount,width,mask_bits,value)
+            self.shuffle_values[self.key(call)] = result
+            if kind == 'BufferStore':
+                try:
+                    self.stmt(node,path)
+                finally:
+                    self.shuffle_values.pop(self.key(call),None)
+                return
         if kind in {'SeqStmt','BlockRealize'}:
             for suffix,child in self.statement_children(node):
                 yield from self.cooperate(child,path+suffix)
@@ -786,11 +1126,17 @@ class TVMInterpreter:
                 yield from self.cooperate(node.body,path+'.body')
         elif kind == 'LetStmt':
             with self.bindings(self.env,[self.key(node.var)]):
-                self.env[self.key(node.var)] = self.expr(node.value,path+'.value')
+                try:
+                    self.env[self.key(node.var)] = self.expr(node.value,path+'.value')
+                finally:
+                    if site is not None:
+                        self.shuffle_values.pop(self.key(site[0]),None)
                 yield from self.cooperate(node.body,path+'.body')
         elif kind == 'AttrStmt':
             if str(node.attr_key) == 'tl.assume':
                 self.check_assumption(node,path)
+                yield from self.cooperate(node.body,path+'.body')
+            elif self.is_launch_hint(node):
                 yield from self.cooperate(node.body,path+'.body')
             else:
                 var = node.node.var
@@ -844,12 +1190,12 @@ class TVMInterpreter:
         elif kind == "For":
             # Serial, Parallel, Unrolled only; vectorized/thread bindings need rules.
             loop_kind = int(node.kind)
-            if loop_kind not in {0,1,3}:
+            if loop_kind not in {0,1,3} and not self.vector_copy_loop(node):
                 raise Unsupported(f"{path}: For kind={node.kind} 尚未支持")
             self.check_for_metadata(node,path)
             lo,n = int(self.expr(node.min,path+".min")),int(self.expr(node.extent,path+".extent"))
             if n<0: raise Unsupported(f"{path}: negative extent")
-            region = self.budget.new_region() if loop_kind == 1 else None
+            region = self.budget.new_region() if loop_kind in {1,2} else None
             key = self.key(node.loop_var)
             old = self.loop_specs.get(key)
             missing=object()
@@ -902,6 +1248,9 @@ class TVMInterpreter:
                 problem=self.tail_error(node.value,TIR_TUPLE,metadata=True)
                 if problem: raise Unsupported(problem)
                 self.event(node.value,path+'.value',action='serial_noop',operation=TIR_TUPLE)
+                self.stmt(node.body,path+'.body')
+                return
+            if self.is_launch_hint(node):
                 self.stmt(node.body,path+'.body')
                 return
             if str(node.attr_key) != "thread_extent":
@@ -985,6 +1334,7 @@ class TVMInterpreter:
         self.loop_specs = {}
         self.loop_stack,self.nonunit_threads = [],0
         self.phase_shared = None
+        self.shuffle_values = {}
         if len(self.fun.params) != len(buffers): raise Unsupported("TIR 参数数量与测试契约不同")
         for param,buf in zip(self.fun.params,buffers):
             if param not in self.fun.buffer_map: raise Unsupported("目前只支持 buffer 参数")
@@ -1009,7 +1359,7 @@ class TVMInterpreter:
                 raise Unsupported("显式 stride 与用例连续布局不一致")
         self.stmt(self.fun.body)
         return {"steps":self.budget.steps,"backend":"tvm_tir_nodes",
-                "execution_model":("serialized shared barrier phases with checked lane accesses"
+                "execution_model":("serialized lane exchanges and shared barrier phases with checked accesses" if self.shuffle_sites else "serialized shared barrier phases with checked lane accesses"
                                    if self.cooperative_launches else "logical blocks; only unused or unit physical thread axes"),
                 "location_model":"node paths + original spans; no exported-text line mapping",
                 "node_events":self.events,"reductions":self.reductions}

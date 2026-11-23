@@ -402,7 +402,7 @@ class TIRInterpreter:
                     return self.explicit_tile_region(node.args[2:])[0]
                 return self.tile_call(operation,node,node.args[2:],raw=True)
             values = [self.eval(a) for a in node.args[2:]]
-            if operation in ('tl.ieee_fdiv','tl.ieee_fmaf') and (not isinstance(node.args[-1],ast.Constant) or node.args[-1].value!='rn'):
+            if operation in ('tl.ieee_fdiv','tl.ieee_fmaf','tl.ieee_frcp') and (not isinstance(node.args[-1],ast.Constant) or node.args[-1].value!='rn'):
                 raise Unsupported(f'L{node.lineno}: {operation} 需要字面量舍入模式 rn')
             return tir_scalar(operation, values, kind)
         if function in TIR_BATCH_SCRIPT:
@@ -427,6 +427,9 @@ class TIRInterpreter:
                 return tir_scalar(operation, values, values[0])
             if not values:
                 raise Unsupported(f'{function} 需要标量输入')
+            if operation == 'tl.ieee_frcp' and (len(node.args) != 2 or
+                    not isinstance(node.args[1],ast.Constant) or node.args[1].value != 'rn'):
+                raise Unsupported(f'{function} 需要一个标量和字面量舍入模式 rn')
             count = {'tl.ieee_fdiv': 2, 'tl.ieee_fmaf': 3}.get(operation)
             if count and len(values)==count:
                 values.append('rn')

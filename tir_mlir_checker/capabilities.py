@@ -5,7 +5,7 @@ TIR_BATCH_SCALARS = {
         'fmod', 'floor', 'trunc', 'sin', 'cos', 'ceil', 'log1p')},
     'tl.infinity': 'infinity', 'tir.infinity': 'infinity',
     'tir.round': 'roundaway', 'tir.nearbyint': 'roundeven', 'tir.pow': 'powf',
-    'tl.ieee_fdiv': 'ieee_div', 'tl.ieee_fmaf': 'fma',
+    'tl.ieee_fdiv': 'ieee_div', 'tl.ieee_frcp': 'ieee_recip', 'tl.ieee_fmaf': 'fma',
     'tir.bitwise_and': 'bitand', 'tir.bitwise_or': 'bitor', 'tir.bitwise_xor': 'bitxor',
     'tir.bitwise_not': 'bitnot', 'tir.shift_left': 'shl', 'tir.shift_right': 'ashr',
     'tir.popcount': 'ctpop', 'tir.clz': 'ctlz', 'tir.reinterpret': 'bitcast',

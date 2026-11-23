@@ -503,6 +503,13 @@ def tir_scalar(operation, values, target, sources=None):
         if len(values) > 1 or (values and not isinstance(values[0], str)):
             raise Unsupported(f'{operation} 仅接受可选的类型字符串')
         return scalar_op(op, [], target)
+    if op == 'ieee_recip':
+        if len(values) != 2 or type(values[1]) is not str or values[1] != 'rn':
+            raise Unsupported(f'{operation} 需要一个标量和字面量舍入模式 rn')
+        if dtype(target).name not in {'float32', 'float64'}:
+            raise Unsupported(f'{operation} 仅支持 float32/float64')
+        source = sources[0] if sources is not None else scalar_type(values[0])
+        return scalar_op('ieee_div', [cast(1, target), values[0]], target, [target, source])
     if op in {'ieee_div', 'fma'}:
         if len(values) != _SCALAR_ARITY[op] + 1 or not isinstance(values[-1], str) or values[-1] != 'rn':
             raise Unsupported(f'{operation} 仅支持字面量舍入模式 rn')
