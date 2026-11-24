@@ -11,6 +11,11 @@
 !/scripts/
 /scripts/*
 !/scripts/run-tir-mlir-mcp.sh
+!/skills/
+/skills/*
+!/skills/tir-mlir-check/
+/skills/tir-mlir-check/*
+!/skills/tir-mlir-check/SKILL.md
 
 __pycache__/
 *.py[cod]
