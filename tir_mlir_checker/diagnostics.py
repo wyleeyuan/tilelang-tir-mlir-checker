@@ -39,7 +39,7 @@ def agent_diagnostics(result):
         mlir_location=item.get('details',{}).get('mlir_location')
         node_location = item.get('details',{}).get('tvm_location') or mlir_location
         if node_location and locations:
-            locations = [dict(locations[0],node_path=node_location['node_path'],
+            locations = [dict(locations[0],node_path=node_location.get('node_path'),
                               original_span=node_location.get('original_span'),
                               ir_location=node_location.get('ir_location'),
                               node_frontend='mlir' if mlir_location else 'tvm'), *locations[1:]]

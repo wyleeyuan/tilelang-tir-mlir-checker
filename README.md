@@ -27,6 +27,40 @@ run = export + check
 
 主检查边界是 **02→03**。五份快照均在 LLVM 后端生成机器码之前；工具可独立运行，也可由 Agent 通过 CLI 调用。
 
+## MCP 服务接入（SG2044 按需启动）
+
+服务通过 stdio 暴露 `run_operator`、`check_trace`、`show_ir`、`export_trace`，客户端连入时启动，关闭 stdin 后退出。无需额外 MCP Python 依赖。在本机可用 `python -m tir_mlir_checker.mcp_server`，安装包后也可用 `tir-mlir-mcp`。
+
+**从本机通过 SSH 启动。** 先配置名为 `sg2044` 的 SSH 别名（用户名、端口、已核验的主机密钥和非交互认证），再把以下内容加入支持 `mcpServers` 的客户端配置：
+
+```json
+{
+  "mcpServers": {
+    "tir-mlir-checker": {
+      "command": "ssh",
+      "args": ["-T", "sg2044", "/home/gudingrui/sg2044-tilelang-riscv/checker/phase4-mcp.msbbKuO3/run-tir-mlir-mcp.sh"]
+    }
+  }
+}
+```
+
+**从 SG2044 本机启动。** 同一套部署也可直接接入：
+
+```json
+{
+  "mcpServers": {
+    "tir-mlir-checker": {
+      "command": "/home/gudingrui/sg2044-tilelang-riscv/checker/phase4-mcp.msbbKuO3/run-tir-mlir-mcp.sh",
+      "args": []
+    }
+  }
+}
+```
+
+[启动脚本](scripts/run-tir-mlir-mcp.sh) 与部署的 `tir_mlir_checker/` 放在同一目录。脚本默认选用 TVM 和官方 MLIR，并调用配置的 `mlir-opt`；显式工具入参优先。SSH 接入时，Trace、适配器和返回的证据路径均位于 SG2044。省略 `out_dir` 时会在部署目录的 `runs/` 下生成独立结果。适配器和补充翻译是可执行 Python，仅传入信任的文件。
+
+退出码 `0/1/4` 都是检查结果（分别为完成、检出差异、不支持），`2/3` 才标记为 MCP 工具错误。响应在 `content` 提供 JSON 文本，并在 `structuredContent` 提供同一对象。真实编译导出、官方结构校验、有限用例数值对照分别记录；数值对照不执行编译产物的机器码。
+
 ## 快速上手：5 分钟跑通 Where 示例
 
 ### 安装与运行

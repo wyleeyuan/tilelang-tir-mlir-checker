@@ -8,6 +8,9 @@
 !/README.md
 !/tir_mlir_checker/
 !/tests/
+!/scripts/
+/scripts/*
+!/scripts/run-tir-mlir-mcp.sh
 
 __pycache__/
 *.py[cod]
